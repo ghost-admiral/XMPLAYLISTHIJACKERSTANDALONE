@@ -1,0 +1,239 @@
+// Standalone Android App: XM Playlist Hijacker with YouTube Data API v3
+
+/*
+Enhanced Features:
+- Scrape XM playlists per channel
+- Maintain an 80-song cap with random shuffle & trim
+- Mark songs as played to auto-delete from playlist
+*/
+
+// settings.gradle
+rootProject.name = "XmPlaylistHijackerStandalone"
+include ":app"
+
+// build.gradle (root)
+buildscript { repositories { google(); mavenCentral() } dependencies { classpath "com.android.tools.build:gradle:7.4.0" }}
+allprojects { repositories { google(); mavenCentral() }}
+task clean(type: Delete) { delete rootProject.buildDir }
+
+// app/build.gradle
+plugins { id 'com.android.application'; id 'kotlin-android'; id 'kotlin-kapt' }
+android { compileSdk 33; defaultConfig { applicationId "com.example.xmplaylisthijacker"; minSdk 21; targetSdk 33; versionCode 1; versionName "1.0" } buildFeatures { compose true } composeOptions { kotlinCompilerExtensionVersion '1.4.7' } signingConfigs { release { /* keystore config */ }} buildTypes { debug {}; release { isMinifyEnabled false; signingConfig signingConfigs.release }} }
+
+dependencies {
+    implementation "androidx.core:core-ktx:1.9.0"
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.8.10"
+    implementation "androidx.activity:activity-compose:1.7.0"
+    implementation "androidx.compose.ui:ui:1.4.3"
+    implementation "androidx.compose.material:material:1.4.3"
+    implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.6.1"
+    implementation "androidx.work:work-runtime-ktx:2.8.1"
+    implementation 'com.squareup.retrofit2:retrofit:2.9.0'
+    implementation 'com.squareup.retrofit2:converter-gson:2.9.0'
+    implementation 'com.squareup.okhttp3:logging-interceptor:4.10.0'
+    implementation 'com.google.android.gms:play-services-auth:20.4.1'
+    implementation 'com.google.api-client:google-api-client-android:1.33.3'
+    implementation 'com.google.apis:google-api-services-youtube:v3-rev20221010-2.0.0'
+    implementation "androidx.datastore:datastore-preferences:1.0.0"
+    implementation "androidx.datastore:datastore-core:1.0.0"
+}
+
+// AndroidManifest.xml
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.example.xmplaylisthijacker">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application android:label="XM Playlist Hijacker" android:icon="@mipmap/ic_launcher">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+// Models.kt
+package com.example.xmplaylisthijacker
+import com.google.api.services.youtube.model.PlaylistItem
+
+data class XMItem(val artist: String, val song: String)
+
+data class ChannelConfig(val playlistId: String, val seen: List<String>)
+
+// XMService.kt
+package com.example.xmplaylisthijacker
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.GET
+import retrofit2.http.Path
+
+interface XMApi { @GET("/api/feed?channel={slug}") suspend fun getFeed(@Path("slug") channel: String): List<XMItem> }
+object XMService { private const val BASE = "https://xmplaylist.com/api/channels/"; val api: XMApi by lazy {
+    Retrofit.Builder().baseUrl(BASE).addConverterFactory(GsonConverterFactory.create()).build().create(XMApi::class.java)
+}}
+
+// MainActivity.kt
+package com.example.xmplaylisthijacker
+import android.content.Intent
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.api.client.extensions.android.http.AndroidHttp
+import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
+import com.google.api.client.json.gson.GsonFactory
+import com.google.api.services.youtube.Youtube
+import com.google.api.services.youtube.model.Playlist
+
+class MainActivity : ComponentActivity() {
+    private lateinit var youtube: Youtube
+    private val RC_SIGN_IN = 1001
+    override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState); requestSignIn() }
+    private fun requestSignIn() {
+        val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestScopes(com.google.android.gms.common.api.Scope("https://www.googleapis.com/auth/youtube"))
+            .requestEmail().build()
+        val client = GoogleSignIn.getClient(this, gso)
+        startActivityForResult(client.signInIntent, RC_SIGN_IN)
+    }
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == RC_SIGN_IN) {
+            val account = GoogleSignIn.getSignedInAccountFromIntent(data).result
+            val credential = GoogleAccountCredential.usingOAuth2(this, listOf("https://www.googleapis.com/auth/youtube"))
+            credential.selectedAccount = account.account
+            youtube = Youtube.Builder(AndroidHttp.newCompatibleTransport(), GsonFactory(), credential)
+                .setApplicationName("XM Playlist Hijacker").build()
+            setContent { DashboardScreen(youtube) }
+        }
+    }
+}
+
+// DashboardScreen.kt
+package com.example.xmplaylisthijacker
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.google.api.services.youtube.Youtube
+
+@Composable
+fun DashboardScreen(youtube: Youtube) {
+    val vm: MainViewModel = viewModel()
+    val channels by vm.channels.collectAsState()
+    val logs by vm.logs.collectAsState()
+    var showDialog by remember { mutableStateOf(false) }
+    var newChannel by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) { vm.scheduleSync(youtube) }
+
+    Scaffold(topBar = { TopAppBar(title = { Text("XM Playlist Hijacker") }) }) { padding ->
+        Column(Modifier.padding(padding).padding(16.dp)) {
+            Row { Button(onClick = { vm.shuffleAll(youtube) }) { Text("Shuffle & Trim") } }
+            Spacer(Modifier.height(8.dp))
+            Button(onClick = { showDialog = true }) { Text("Add Channel") }
+            Spacer(Modifier.height(16.dp))
+            Text("Channels:")
+            LazyColumn { items(channels) { slug ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(slug)
+                    Button(onClick = { vm.removePlayed(slug, youtube) }) { Text("Mark Played") }
+                }
+            }}
+            Spacer(Modifier.height(16.dp))
+            Text("Logs:")
+            LazyColumn { items(logs) { Text(it) } }
+        }
+        if (showDialog) {
+            AlertDialog(onDismissRequest = { showDialog = false }, title = { Text("Add XM Channel") }, text = {
+                TextField(value = newChannel, onValueChange = { newChannel = it }, label = { Text("Channel Slug") })
+            }, confirmButton = {
+                TextButton(onClick = { vm.addChannel(newChannel, youtube); showDialog = false }) { Text("Add") }
+            }, dismissButton = { TextButton(onClick = { showDialog = false }) { Text("Cancel") } })
+        }
+    }
+}
+
+// MainViewModel.kt
+package com.example.xmplaylisthijacker
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.work.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import com.google.api.services.youtube.Youtube
+import com.google.api.services.youtube.model.PlaylistItem
+import java.util.concurrent.TimeUnit
+
+class MainViewModel(app: Application): AndroidViewModel(app) {
+    private val _channels = MutableStateFlow<List<String>>(emptyList())
+    private val _logs = MutableStateFlow<List<String>>(emptyList())
+    val channels = _channels.asStateFlow()
+    val logs = _logs.asStateFlow()
+
+    fun addChannel(slug: String, youtube: Youtube) = viewModelScope.launch {
+        // create playlist
+        val pl = youtube.playlists().insert("snippet,status", com.google.api.services.youtube.model.Playlist().apply {
+            snippet = Playlist.Snippet().apply { title = slug; description = "Auto for $slug" }
+            status = Playlist.Status().apply { privacyStatus = "private" }
+        }).execute()
+        _channels.value = _channels.value + slug
+        _logs.value += "Created playlist ${pl.id} for $slug"
+    }
+
+    fun shuffleAll(youtube: Youtube) = viewModelScope.launch {
+        channels.value.forEach { shufflePlaylist(it, youtube) }
+    }
+
+    private suspend fun shufflePlaylist(slug: String, youtube: Youtube) {
+        // fetch all items
+        val resp = youtube.playlistItems().list(listOf("snippet")).apply { playlistId = getId(slug); maxResults = 100L }.execute()
+        val items = resp.items.toMutableList()
+        items.shuffle()
+        // trim to 80
+        val toRemove = items.drop(80)
+        toRemove.forEach {
+            youtube.playlistItems().delete(it.id).execute()
+            _logs.value += "Removed ${it.snippet.title} from $slug"
+        }
+        _logs.value += "Shuffle & trim complete for $slug"
+    }
+
+    fun removePlayed(slug: String, youtube: Youtube) = viewModelScope.launch {
+        // get next item
+        val resp = youtube.playlistItems().list(listOf("snippet")).apply { playlistId = getId(slug); maxResults = 1L }.execute()
+        if (resp.items.isNotEmpty()) {
+            val item = resp.items[0]
+            youtube.playlistItems().delete(item.id).execute()
+            _logs.value += "Marked played & removed ${item.snippet.title} from $slug"
+        }
+    }
+
+    fun scheduleSync(youtube: Youtube) {
+        val req = PeriodicWorkRequestBuilder<SyncWorker>(1, TimeUnit.HOURS)
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build()
+        WorkManager.getInstance(getApplication()).enqueueUniquePeriodicWork("sync", ExistingPeriodicWorkPolicy.KEEP, req)
+    }
+
+    private fun getId(slug: String): String {
+        // TODO: map slug to stored playlistId
+        return ""
+    }
+}
+
+// SyncWorker.kt
+package com.example.xmplaylisthijacker
+import android.content.Context
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+
+class SyncWorker(ctx: Context, params: WorkerParameters): CoroutineWorker(ctx, params) {
+    override suspend fun doWork(): Result {
+        // could call shuffleAll or sync logic here
+        return Result.success()
+    }
+}
